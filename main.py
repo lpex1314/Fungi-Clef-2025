@@ -364,10 +364,15 @@ def evaluate(model, dataloader, criterion, device, dataset, k=10):
 # 主函数
 def main():
     # 路径设置
-    data_root = "data/fungi-clef-2025"  # 修改为实际数据集路径
+    data_root = "/root/autodl-tmp/KaggleHub/fungi-clef-2025/"  # 修改为实际数据集路径
     
     # 加载 BioCLIP 模型和预处理
-    model, _, preprocess = open_clip.create_model_and_transforms('hf-hub:imageomics/bioclip')
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        model_name=config.model_name,
+        pretrained='/root/autodl-fs/manual_download_model/open_clip_pytorch_model.bin',
+        model_config_path='/root/autodl-fs/manual_download_model/model_config.json',
+        local_files_only=True
+    )
     # tokenizer = open_clip.get_tokenizer('hf-hub:imageomics/bioclip')
     
     # 创建数据集
