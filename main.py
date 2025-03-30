@@ -10,6 +10,7 @@ from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score, top_k_accuracy_score
 from typing import List
 import matplotlib.pyplot as plt
+import kagglehub
 import open_clip  # Import open_clip instead of bioclip
 
 # 设置随机种子以保证可重复性
@@ -364,7 +365,7 @@ def evaluate(model, dataloader, criterion, device, dataset, k=10):
 # 主函数
 def main():
     # 路径设置
-    data_root = "data/fungi-clef-2025"  # 修改为实际数据集路径
+    data_root = kagglehub.competition_download(handle='fungi-clef-2025')  # 修改为实际数据集路径
     
     # 加载 BioCLIP 模型和预处理
     model, _, preprocess = open_clip.create_model_and_transforms('hf-hub:imageomics/bioclip')
