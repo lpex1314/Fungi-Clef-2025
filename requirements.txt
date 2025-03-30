@@ -3,3 +3,4 @@ git+https://github.com/mlfoundations/open_clip.git
 faiss-cpu
 scikit-learn
 kagglehub
+matplotlib
