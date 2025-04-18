@@ -1,3 +1,4 @@
+
 import os
 import torch
 import torch.nn as nn
@@ -12,7 +13,6 @@ import matplotlib.pyplot as plt
 from typing import List
 import warnings
 
-
 # Set random seed for reproducibility
 def set_seed(seed=42):
     torch.manual_seed(seed)
@@ -26,7 +26,7 @@ set_seed()
 class Config:
     batch_size = 32
     learning_rate = 2e-5
-    epochs = 5
+    epochs = 20
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_name = "hf-hub:imageomics/bioclip"
     num_classes = 0
@@ -188,6 +188,8 @@ class FungiTastic(torch.utils.data.Dataset):
             return self.df[self.df.category_id == category_id].index.tolist()
         return []
 
+
+
 class FungiEmbedder(nn.Module):
     """
     Wrapper for extracting image embeddings using a pre-trained visual model.
@@ -196,13 +198,20 @@ class FungiEmbedder(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
-        for name, param in self.model.named_parameters():
-            if "visual.transformer.resblocks.11" not in name and "visual.transformer.resblocks.10" not in name:
+        for name, param in model.named_parameters():
+            if "visual.transformer.resblocks." in name and any(f"resblocks.{i}" in name for i in [9, 10, 11]):
+                param.requires_grad = True
+            elif "ln_post" in name or "positional_embedding" or "visual.proj" in name:
+                param.requires_grad = True
+            else:
                 param.requires_grad = False
+
 
     def forward(self, pixel_values):
        return self.model.encode_image(pixel_values)
 
+
+# %%
 class PrototypicalLoss(nn.Module):
     """
     Prototypical loss that computes classification loss based on distances
@@ -212,10 +221,11 @@ class PrototypicalLoss(nn.Module):
         super().__init__()
 
     def forward(self, embeddings, targets, prototypes):
-        dists = torch.cdist(embeddings, prototypes, p=2)
-        logits = -dists
+        dists = torch.cdist(embeddings, prototypes, p=2) # (B, C)
+        logits = -dists # (B, C)
         loss = nn.functional.cross_entropy(logits, targets)
         return loss, logits
+
 
 def compute_prototypes(model, dataloader, device, num_classes):
     """
@@ -233,6 +243,9 @@ def compute_prototypes(model, dataloader, device, num_classes):
             embeddings = model(images)
             for emb, label in zip(embeddings, labels):
                 all_embeddings[label.item()].append(emb.cpu())
+            # delete to free up memory
+            del images, labels, embeddings
+            torch.cuda.empty_cache()
 
     prototypes = []
     for class_embs in all_embeddings:
@@ -242,6 +255,7 @@ def compute_prototypes(model, dataloader, device, num_classes):
             prototypes.append(torch.stack(class_embs).mean(dim=0))
 
     return torch.stack(prototypes).to(device)
+
 
 def train_epoch_protonet(model, dataloader, criterion, optimizer, device, prototypes):
     """
@@ -263,11 +277,38 @@ def train_epoch_protonet(model, dataloader, criterion, optimizer, device, protot
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         epoch_loss += loss.item()
         preds = torch.argmax(logits, dim=1).cpu().numpy()
         all_preds.extend(preds)
         all_labels.extend(labels.cpu().numpy())
+
+    accuracy = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average='macro')
+    return epoch_loss / len(dataloader), accuracy, f1
+
+
+def evaluate_epoch_protonet(model, dataloader, criterion, device, prototypes):
+    model.eval()
+    epoch_loss = 0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Validating"):
+            images, labels, _, _ = batch
+            images = images.to(device)
+            labels = labels.to(device)
+
+            embeddings = model(images)
+            loss, logits = criterion(embeddings, labels, prototypes)
+
+            epoch_loss += loss.item()
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
 
     accuracy = accuracy_score(all_labels, all_preds)
     f1 = f1_score(all_labels, all_preds, average='macro')
@@ -284,6 +325,8 @@ def test_collate_fn(batch):
     observation_ids = [item[3] for item in batch]
     return images, labels, file_paths, observation_ids
 
+
+# ## Mean Pooling
 def evaluate_protonet_grouped(model, dataloader, prototypes, device, dataset, k=10, save_path="test_predictions.csv"):
     """
     Evaluate using prototype similarity and group predictions by observation ID.
@@ -330,18 +373,12 @@ def evaluate_protonet_grouped(model, dataloader, prototypes, device, dataset, k=
     return df
 
 
-def main():
+if __name__ == "__main__":
     data_root = "data/fungi-clef-2025"
 
     # Load BioCLIP model and preprocessing function
     model, _, preprocess = open_clip.create_model_and_transforms(config.model_name)
     embedder = FungiEmbedder(model).to(config.device)
-    
-    # for name, param in embedder.named_parameters():
-    #     if param.requires_grad:
-    #         print(f"Training parameter: {name}")
-    #     else:
-    #         print(f"Freezing parameter: {name}")
 
     # Load datasets
     train_dataset = FungiTastic(root=data_root, split='train', transform=preprocess)
@@ -352,20 +389,82 @@ def main():
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    
+
     # Initialize loss function and optimizer
     criterion = PrototypicalLoss()
     optimizer = torch.optim.AdamW(embedder.parameters(), lr=config.learning_rate)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5)
+
 
     # Compute class prototypes from training data
     prototypes = compute_prototypes(embedder, train_loader, config.device, config.num_classes)
 
-    # Training loop
+    train_losses, val_losses = [], []
+    train_accuracies, val_accuracies = [], []
+    train_f1s, val_f1s = [], []
+
+    best_val_acc = 0.0
+    patience = 5
+    patience_counter = 0
+
+    checkpoint_path = os.path.join(data_root, "best_fungiembedder.pt")
+
     for epoch in range(config.epochs):
         print(f"Epoch {epoch+1}/{config.epochs}")
+        # Train one epoch
         train_loss, train_acc, train_f1 = train_epoch_protonet(embedder, train_loader, criterion, optimizer, config.device, prototypes)
+        scheduler.step()
+        # Evaluate on validation set
+        val_loss, val_acc, val_f1 = evaluate_epoch_protonet(embedder, val_loader, criterion, config.device, prototypes)
+
         print(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, F1: {train_f1:.4f}")
-    
+        print(f"Val   Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
+
+        # Save metrics for plotting
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accuracies.append(train_acc)
+        val_accuracies.append(val_acc)
+        train_f1s.append(train_f1)
+        val_f1s.append(val_f1)
+
+        # Checkpoint saving
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': embedder.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_acc,
+                'val_loss': val_loss,
+            }, checkpoint_path)
+            print(f"✅ New best model saved! Validation Acc: {val_acc:.4f}")
+        else:
+            patience_counter += 1
+            print(f"⚠️  No improvement. Patience: {patience_counter}/{patience}")
+
+        # Early stopping
+        if patience_counter >= patience:
+            print("🛑 Early stopping triggered.")
+            break
+        
+    # save best model
+    torch.save({
+        'epoch': epoch + 1,
+        'model_state_dict': embedder.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }, "best_fungiembedder.pt")
+
+    # Load the best model
+    checkpoint_path = 'best_fungiembedder.pt'
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        embedder.load_state_dict(checkpoint['model_state_dict'])
+        print(f"✅ Model loaded from {checkpoint_path}")
+
+    # Evaluate on test set
+
     test_loader = DataLoader(
         test_dataset,
         batch_size=config.batch_size,
@@ -374,8 +473,7 @@ def main():
         pin_memory=True,
         collate_fn=test_collate_fn
     )
-    
-    # Evaluate on test set
+
     evaluate_protonet_grouped(
         model=embedder,
         dataloader=test_loader,
@@ -384,7 +482,4 @@ def main():
         dataset=test_dataset,
         k=config.top_k,
         save_path="results/test_predictions_protoNet_grouped.csv"
-    )
-
-if __name__ == "__main__":
-    main()
+)
