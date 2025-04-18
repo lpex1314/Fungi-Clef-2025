@@ -1,18 +1,19 @@
+
 import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
 from PIL import Image
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from sklearn.metrics import accuracy_score, f1_score, top_k_accuracy_score
-from typing import List
+from sklearn.metrics import accuracy_score, f1_score
+import open_clip
 import matplotlib.pyplot as plt
-import open_clip  # Import open_clip instead of bioclip
+from typing import List
+import warnings
 
-# 设置随机种子以保证可重复性
+# Set random seed for reproducibility
 def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -21,20 +22,19 @@ def set_seed(seed=42):
 
 set_seed()
 
-# 配置参数
+# Configuration class
 class Config:
     batch_size = 32
     learning_rate = 2e-5
-    epochs = 15
+    epochs = 20
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_name = "hf-hub:imageomics/bioclip"  # 从Hugging Face Hub加载BioCLIP模型
-    num_classes = 0  # 将在加载数据集后更新
-    image_size = 224  # BioCLIP预期的图像大小
-    top_k = 10  # 评估前k个预测类别
+    model_name = "hf-hub:imageomics/bioclip"
+    num_classes = 0
+    image_size = 224
+    top_k = 10
 
 config = Config()
 
-# 使用提供的FungiTastic类
 class FungiTastic(torch.utils.data.Dataset):
     """
     Dataset class for the FewShot subset of the Danish Fungi dataset (size 300, closed-set).
@@ -188,307 +188,298 @@ class FungiTastic(torch.utils.data.Dataset):
             return self.df[self.df.category_id == category_id].index.tolist()
         return []
 
-# 针对大量类别优化的分类器
-class FungiClassifier(nn.Module):
-    def __init__(self, model, preprocess, num_classes):
-        super(FungiClassifier, self).__init__()
-        # 保存预训练模型
+
+
+class FungiEmbedder(nn.Module):
+    """
+    Wrapper for extracting image embeddings using a pre-trained visual model.
+    Most layers are frozen except the final two transformer blocks.
+    """
+    def __init__(self, model):
+        super().__init__()
         self.model = model
-        self.preprocess = preprocess
-        
-        # 冻结模型的大部分参数
-        for name, param in self.model.named_parameters():
-            if "visual.transformer.resblocks.11" not in name and "visual.transformer.resblocks.10" not in name:
+        for name, param in model.named_parameters():
+            if "visual.transformer.resblocks." in name and any(f"resblocks.{i}" in name for i in [9, 10, 11]):
+                param.requires_grad = True
+            elif "ln_post" in name or "positional_embedding" or "visual.proj" in name:
+                param.requires_grad = True
+            else:
                 param.requires_grad = False
-        
-        # 获取BioCLIP的嵌入维度
-        if hasattr(self.model, 'visual.proj'):
-            embedding_dim = self.model.visual.proj.shape[0]  # CLIP-style models
-        else:
-            # Typically 512 for BioCLIP
-            embedding_dim = 512
-        
-        # 针对大量类别优化的分类头
-        self.classifier = nn.Sequential(
-            nn.Linear(embedding_dim, 1024),
-            nn.LayerNorm(1024),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(1024, 1024),
-            nn.LayerNorm(1024),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(1024, num_classes)
-        )
-        
-        # 初始化分类器权重
-        self._init_weights(self.classifier)
-        
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-                
+
+
     def forward(self, pixel_values):
-        # 获取特征
-        with torch.no_grad():
-            image_features = self.model.encode_image(pixel_values)
-            
-        # 通过分类器
-        logits = self.classifier(image_features)
-        return logits
+       return self.model.encode_image(pixel_values)
 
-# 标签平滑交叉熵损失
-class LabelSmoothingCrossEntropy(nn.Module):
-    def __init__(self, smoothing=0.1):
-        super(LabelSmoothingCrossEntropy, self).__init__()
-        self.smoothing = smoothing
-        
-    def forward(self, x, target):
-        confidence = 1. - self.smoothing
-        logprobs = nn.functional.log_softmax(x, dim=-1)
-        nll_loss = -logprobs.gather(dim=-1, index=target.unsqueeze(1))
-        nll_loss = nll_loss.squeeze(1)
-        smooth_loss = -logprobs.mean(dim=-1)
-        loss = confidence * nll_loss + self.smoothing * smooth_loss
-        return loss.mean()
 
-# 训练函数
-def train_epoch(model, dataloader, criterion, optimizer, device):
+# %%
+class PrototypicalLoss(nn.Module):
+    """
+    Prototypical loss that computes classification loss based on distances
+    between input embeddings and class prototypes.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, embeddings, targets, prototypes):
+        dists = torch.cdist(embeddings, prototypes, p=2) # (B, C)
+        logits = -dists # (B, C)
+        loss = nn.functional.cross_entropy(logits, targets)
+        return loss, logits
+
+
+def compute_prototypes(model, dataloader, device, num_classes):
+    """
+    Compute class prototypes by averaging embeddings from support samples
+    for each class in the dataset.
+    """
+    model.eval()
+    all_embeddings = [[] for _ in range(num_classes)]
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Extracting Prototypes"):
+            images, labels, _, _ = batch
+            images = images.to(device)
+            labels = labels.to(device)
+            embeddings = model(images)
+            for emb, label in zip(embeddings, labels):
+                all_embeddings[label.item()].append(emb.cpu())
+            # delete to free up memory
+            del images, labels, embeddings
+            torch.cuda.empty_cache()
+
+    prototypes = []
+    for class_embs in all_embeddings:
+        if len(class_embs) == 0:
+            prototypes.append(torch.zeros_like(embeddings[0]))
+        else:
+            prototypes.append(torch.stack(class_embs).mean(dim=0))
+
+    return torch.stack(prototypes).to(device)
+
+
+def train_epoch_protonet(model, dataloader, criterion, optimizer, device, prototypes):
+    """
+    Train one epoch using Prototypical Network logic.
+    """
     model.train()
     epoch_loss = 0
     all_preds = []
     all_labels = []
-    
+
     for batch in tqdm(dataloader, desc="Training"):
-        images, labels, _, _ = batch  # 忽略其他信息
+        images, labels, _, _ = batch
         images = images.to(device)
         labels = labels.to(device)
-        
-        # 前向传播
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        
-        # 反向传播和优化
+
+        embeddings = model(images)
+        loss, logits = criterion(embeddings, labels, prototypes)
+
         optimizer.zero_grad()
         loss.backward()
-        
-        # 梯度裁剪
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
         optimizer.step()
-        
-        # 累积损失
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         epoch_loss += loss.item()
-        
-        # 收集预测结果
-        preds = torch.argmax(outputs, dim=1).cpu().numpy()
+        preds = torch.argmax(logits, dim=1).cpu().numpy()
         all_preds.extend(preds)
         all_labels.extend(labels.cpu().numpy())
-    
-    # 计算指标
+
     accuracy = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='macro')  # 对于多类别，使用macro平均
-    
+    f1 = f1_score(all_labels, all_preds, average='macro')
     return epoch_loss / len(dataloader), accuracy, f1
 
-# 评估函数 - 包含Top-K预测
-def evaluate(model, dataloader, criterion, device, dataset, k=10):
+
+def evaluate_epoch_protonet(model, dataloader, criterion, device, prototypes):
     model.eval()
     epoch_loss = 0
     all_preds = []
     all_labels = []
-    all_probs = []  # 存储所有预测的概率
-    all_observation_ids = []  # 存储所有观察ID
-    
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Validating"):
+            images, labels, _, _ = batch
+            images = images.to(device)
+            labels = labels.to(device)
+
+            embeddings = model(images)
+            loss, logits = criterion(embeddings, labels, prototypes)
+
+            epoch_loss += loss.item()
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
+
+    accuracy = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average='macro')
+    return epoch_loss / len(dataloader), accuracy, f1
+
+def test_collate_fn(batch):
+    """
+    Custom collate function for test dataloader,
+    allows category_id to be None.
+    """
+    images = torch.stack([item[0] for item in batch])
+    labels = [item[1] for item in batch]  # will be all None
+    file_paths = [item[2] for item in batch]
+    observation_ids = [item[3] for item in batch]
+    return images, labels, file_paths, observation_ids
+
+
+# ## Mean Pooling
+def evaluate_protonet_grouped(model, dataloader, prototypes, device, dataset, k=10, save_path="test_predictions.csv"):
+    """
+    Evaluate using prototype similarity and group predictions by observation ID.
+    Aggregates predictions per observation using mean pooling.
+
+
+    Args:
+        model: FungiEmbedder
+        dataloader: test dataloader
+        prototypes: tensor [num_classes, embedding_dim]
+        device: cuda/cpu
+        dataset: FungiTastic (for ID mapping)
+        k: number of top predictions
+        save_path: CSV save path
+    """
+    model.eval()
+    observation_logits = {}
+
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            images, labels, _, observation_ids = batch
+            images, _, _, observation_ids = batch
             images = images.to(device)
-            
-            if labels is not None:
-                labels = labels.to(device)
-            
-            # 前向传播
-            outputs = model(images)
-            
-            # 使用softmax获取类别概率
-            probs = torch.nn.functional.softmax(outputs, dim=1)
-            
-            if labels is not None:
-                loss = criterion(outputs, labels)
-                epoch_loss += loss.item()
-                
-                # 收集预测结果
-                preds = torch.argmax(outputs, dim=1).cpu().numpy()
-                all_preds.extend(preds)
-                all_labels.extend(labels.cpu().numpy())
-            
-            all_probs.extend(probs.cpu().numpy())
-            all_observation_ids.extend(observation_ids)
-    
-    # 如果有标签，计算标准指标
-    if all_labels:
-        accuracy = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average='macro')
-        top_k_acc = top_k_accuracy_score(all_labels, all_probs, k=k, labels=range(dataset.n_classes))
-    else:
-        accuracy = f1 = top_k_acc = 0.0
-    
-    # 创建预测结果
-    results = []
-    for i, (obs_id, probs) in enumerate(zip(all_observation_ids, all_probs)):
-        # 获取前k个最高概率的索引
-        top_k_indices = np.argsort(probs)[-k:][::-1]
-        
-        # 创建以空格分隔的前k个预测的类别ID字符串
-        predictions = ' '.join([str(idx) for idx in top_k_indices])
-        
-        result = {
-            "ObservationId": obs_id,
-            "predictions": predictions
-        }
-        
-        results.append(result)
-    
-    # 保存为CSV
-    results_df = pd.DataFrame(results)
-    results_df.to_csv("test_predictions.csv", index=False)
-    
-    if all_labels:
-        return epoch_loss / len(dataloader), accuracy, f1, top_k_acc
-    else:
-        return 0, 0, 0, 0
+            embeddings = model(images)
+            dists = torch.cdist(embeddings, prototypes, p=2)  # [B, C]
+            probs = -dists  # higher is better
 
-# 主函数
-def main():
-    # 路径设置
-    data_root = "data/fungi-clef-2025"  # 修改为实际数据集路径
-    
-    # 加载 BioCLIP 模型和预处理
-    model, _, preprocess = open_clip.create_model_and_transforms('hf-hub:imageomics/bioclip')
-    # tokenizer = open_clip.get_tokenizer('hf-hub:imageomics/bioclip')
-    
-    # 创建数据集
-    train_fungi_dataset = FungiTastic(
-        root=data_root,
-        split='train',
-        transform=preprocess
-    )
-    
-    val_fungi_dataset = FungiTastic(
-        root=data_root,
-        split='val',
-        transform=preprocess
-    )
-    
-    test_fungi_dataset = FungiTastic(
-        root=data_root,
-        split='test',
-        transform=preprocess
-    )
-    
-    # 更新配置中的类别数量
-    config.num_classes = train_fungi_dataset.n_classes
-    print(f"数据集包含 {config.num_classes} 个真菌类别")
-    
-    # 创建数据加载器
-    train_loader = DataLoader(
-        train_fungi_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    val_loader = DataLoader(
-        val_fungi_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    test_loader = DataLoader(
-        test_fungi_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    # 创建模型
-    model = FungiClassifier(model, preprocess, config.num_classes)
-    model = model.to(config.device)
-    
-    # 使用标签平滑的损失函数
-    criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
-    
-    # 优化器 - 针对不同参数组使用不同学习率
-    optimizer = optim.AdamW([
-        {'params': [p for n, p in model.named_parameters() if 'classifier' not in n], 'lr': config.learning_rate / 10},
-        {'params': [p for n, p in model.named_parameters() if 'classifier' in n], 'lr': config.learning_rate}
-    ])
-    
-    # 学习率调度器
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=5,
-        T_mult=1,
-        eta_min=1e-6
-    )
-    
-    # 训练循环
-    best_top_k = 0.0
-    for epoch in range(config.epochs):
-        print(f"Epoch {epoch+1}/{config.epochs}")
-        
-        # 训练
-        train_loss, train_acc, train_f1 = train_epoch(
-            model, train_loader, criterion, optimizer, config.device
-        )
-        
-        # 评估
-        val_loss, val_acc, val_f1, val_top_k = evaluate(
-            model, val_loader, criterion, config.device, val_fungi_dataset, k=config.top_k
-        )
-        
-        # 学习率调整
-        scheduler.step()
-        
-        # 打印指标
-        print(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, F1: {train_f1:.4f}")
-        print(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}, Top-{config.top_k} Acc: {val_top_k:.4f}")
-        
-        # 保存最佳模型 - 根据Top-K准确率
-        if val_top_k > best_top_k:
-            best_top_k = val_top_k
-            # 保存模型
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-                'val_acc': val_acc,
-                'val_f1': val_f1,
-                'val_top_k': val_top_k,
-                'category_id2label': val_fungi_dataset.category_id2label
-            }, os.path.join(data_root, "best_fungi_classifier.pth"))
-            print(f"保存最佳模型!Top-{config.top_k} Acc: {val_top_k:.4f}")
-    
-    print(f"训练完成！最佳 Top-{config.top_k} 准确率: {best_top_k:.4f}")
-    
-    # 加载最佳模型并进行最终评估
-    checkpoint = torch.load(os.path.join(data_root, "best_fungi_classifier.pth"))
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    print("使用最佳模型进行最终测试集评估...")
-    evaluate(
-        model, test_loader, criterion, config.device, test_fungi_dataset, k=config.top_k
-    )
-    
-    print("测试集预测完成，结果已保存到 'test_predictions.csv'")
+            probs = probs.cpu().numpy()
+            for i, obs_id in enumerate(observation_ids):
+                if obs_id not in observation_logits:
+                    observation_logits[obs_id] = []
+                observation_logits[obs_id].append(probs[i])
+
+    # Aggregate per observation
+    results = []
+    for obs_id, logits_list in observation_logits.items():
+        avg_logits = np.mean(logits_list, axis=0)
+        topk = np.argsort(avg_logits)[-k:][::-1]
+        predictions = ' '.join(str(c) for c in topk)
+        results.append({'ObservationId': obs_id, 'predictions': predictions})
+
+    df = pd.DataFrame(results)
+    df.to_csv(save_path, index=False)
+    print(f"Saved grouped prediction results to {save_path}")
+    return df
+
 
 if __name__ == "__main__":
-    main()
+    data_root = "data/fungi-clef-2025"
+
+    # Load BioCLIP model and preprocessing function
+    model, _, preprocess = open_clip.create_model_and_transforms(config.model_name)
+    embedder = FungiEmbedder(model).to(config.device)
+
+    # Load datasets
+    train_dataset = FungiTastic(root=data_root, split='train', transform=preprocess)
+    val_dataset = FungiTastic(root=data_root, split='val', transform=preprocess)
+    test_dataset = FungiTastic(root=data_root, split='test', transform=preprocess)
+
+    config.num_classes = train_dataset.n_classes
+
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    # Initialize loss function and optimizer
+    criterion = PrototypicalLoss()
+    optimizer = torch.optim.AdamW(embedder.parameters(), lr=config.learning_rate)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5)
+
+
+    # Compute class prototypes from training data
+    prototypes = compute_prototypes(embedder, train_loader, config.device, config.num_classes)
+
+    train_losses, val_losses = [], []
+    train_accuracies, val_accuracies = [], []
+    train_f1s, val_f1s = [], []
+
+    best_val_acc = 0.0
+    patience = 5
+    patience_counter = 0
+
+    checkpoint_path = os.path.join(data_root, "best_fungiembedder.pt")
+
+    for epoch in range(config.epochs):
+        print(f"Epoch {epoch+1}/{config.epochs}")
+        # Train one epoch
+        train_loss, train_acc, train_f1 = train_epoch_protonet(embedder, train_loader, criterion, optimizer, config.device, prototypes)
+        scheduler.step()
+        # Evaluate on validation set
+        val_loss, val_acc, val_f1 = evaluate_epoch_protonet(embedder, val_loader, criterion, config.device, prototypes)
+
+        print(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, F1: {train_f1:.4f}")
+        print(f"Val   Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
+
+        # Save metrics for plotting
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accuracies.append(train_acc)
+        val_accuracies.append(val_acc)
+        train_f1s.append(train_f1)
+        val_f1s.append(val_f1)
+
+        # Checkpoint saving
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': embedder.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_acc,
+                'val_loss': val_loss,
+            }, checkpoint_path)
+            print(f"✅ New best model saved! Validation Acc: {val_acc:.4f}")
+        else:
+            patience_counter += 1
+            print(f"⚠️  No improvement. Patience: {patience_counter}/{patience}")
+
+        # Early stopping
+        if patience_counter >= patience:
+            print("🛑 Early stopping triggered.")
+            break
+        
+    # save best model
+    torch.save({
+        'epoch': epoch + 1,
+        'model_state_dict': embedder.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }, "best_fungiembedder.pt")
+
+    # Load the best model
+    checkpoint_path = 'best_fungiembedder.pt'
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        embedder.load_state_dict(checkpoint['model_state_dict'])
+        print(f"✅ Model loaded from {checkpoint_path}")
+
+    # Evaluate on test set
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=test_collate_fn
+    )
+
+    evaluate_protonet_grouped(
+        model=embedder,
+        dataloader=test_loader,
+        prototypes=prototypes,
+        device=config.device,
+        dataset=test_dataset,
+        k=config.top_k,
+        save_path="results/test_predictions_protoNet_grouped.csv"
+)
