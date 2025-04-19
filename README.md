@@ -50,22 +50,11 @@ python main.py
 ```
 ## 📊 Experimental Results
 
-Setting	Top-5 Accuracy
-\begin{table}[h]
-    \centering
-    \begin{tabular}{l|c}
-        \toprule
-        \textbf{Setting} & \textbf{Top-5 Accuracy} \\
-        \midrule
-        Max pooling (resblocks.10--11) & 0.42477 \\
-        Voting (resblocks.10--11)      & 0.41592 \\
-        Average pooling (resblocks.10--11)& \textbf{0.44247} \\
-        \textbf{Average pooling + more layers fine-tuned}& \textbf{0.47787} \\
-        \bottomrule
-    \end{tabular}
-    \caption{Ablation study on pooling strategy and fine-tuning scope.}
-    \label{tab:ablation}
-\end{table}
+Setting	Top-5 Accuracy \
+BioCLIP + FAISS + Prototypes (baseline)	0.33185 \
+Max pooling (resblocks.10–11)	0.42477 \
+Average pooling (resblocks.10–11)	0.44247 \
+Average pooling + more fine-tuned layers	0.47787 
 
 ## 🧠 Key Insight
 While Prototypical Networks with frozen prototypes offer strong few-shot generalization, fixing the prototype positions limits class separability. Future work could explore learnable prototypes, margin-based loss, and dynamic prototype updates to further optimize inter-class distances.
