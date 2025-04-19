@@ -1,6 +1,6 @@
-# 🧬  AMLS_II_assignment24_25/ ProtoNet: Few-Shot Fine-Grained Fungal Species Classification
+# AMLS_II_assignment24_25/ ProtoNet: Few-Shot Fine-Grained Fungal Species Classification
 
-This repository contains the official implementation of my solution to the **FungiCLEF 2025 Challenge**, a few-shot fine-grained visual classification competition hosted on [Kaggle](https://www.kaggle.com/competitions/fungi-clef-2025).
+This repository contains the official implementation of my solution to the **FungiCLEF 2025 Challenge**, a few-shot fine-grained visual classification competition hosted on [Kaggle](https://www.kaggle.com/competitions/fungi-clef-2025/data).
 
 🏆 Final Result: 
 📈 Public Top-5 Accuracy: **0.47787** (outperforming official BioCLIP + FAISS baseline)
@@ -13,10 +13,10 @@ This project leverages **BioCLIP** — a biodiversity-adapted CLIP model — and
 
 Key components:
 
-- ⚙️ **FungiEmbedder**: A fine-tuned image encoder based on BioCLIP (ViT backbone), with selective unfreezing of top layers.
-- 📐 **Fixed Prototypes**: Class-wise mean embeddings are precomputed and frozen as class prototypes.
-- 🧠 **Prototypical Loss**: Distance-based cross-entropy loss for pulling embeddings closer to their class prototype.
-- 📊 **Multi-image aggregation**: Average pooling across images from the same observation improves robustness.
+-  **FungiEmbedder**: A fine-tuned image encoder based on BioCLIP (ViT backbone), with selective unfreezing of top layers.
+-  **Fixed Prototypes**: Class-wise mean embeddings are precomputed and frozen as class prototypes.
+-  **Prototypical Loss**: Distance-based cross-entropy loss for pulling embeddings closer to their class prototype.
+-  **Multi-image aggregation**: Average pooling across images from the same observation improves robustness.
 
 ---
 
@@ -51,10 +51,21 @@ python main.py
 ## 📊 Experimental Results
 
 Setting	Top-5 Accuracy
-BioCLIP + FAISS + Prototypes (baseline)	0.33185
-Max pooling (resblocks.10–11)	0.42477
-Average pooling (resblocks.10–11)	0.44247
-Average pooling + more fine-tuned layers	0.47787
+\begin{table}[h]
+    \centering
+    \begin{tabular}{l|c}
+        \toprule
+        \textbf{Setting} & \textbf{Top-5 Accuracy} \\
+        \midrule
+        Max pooling (resblocks.10--11) & 0.42477 \\
+        Voting (resblocks.10--11)      & 0.41592 \\
+        Average pooling (resblocks.10--11)& \textbf{0.44247} \\
+        \textbf{Average pooling + more layers fine-tuned}& \textbf{0.47787} \\
+        \bottomrule
+    \end{tabular}
+    \caption{Ablation study on pooling strategy and fine-tuning scope.}
+    \label{tab:ablation}
+\end{table}
 
 ## 🧠 Key Insight
 While Prototypical Networks with frozen prototypes offer strong few-shot generalization, fixing the prototype positions limits class separability. Future work could explore learnable prototypes, margin-based loss, and dynamic prototype updates to further optimize inter-class distances.
