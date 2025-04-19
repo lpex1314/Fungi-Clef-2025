@@ -39,7 +39,7 @@ Key components:
 ## 🚀 Quick Start
 Download the FungiCLEF 2025 dataset from Kaggle, unzip and save to `data/`.
 
-Install dependencies (requires Python 3.9+ and CUDA-enabled GPU):
+Install dependencies (requires Python 3.9+, CUDA-enabled GPU, cuda version torch):
 ```
 pip install -r requirements.txt
 ```
