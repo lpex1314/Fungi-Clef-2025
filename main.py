@@ -1,4 +1,8 @@
-
+'''
+The following code is a script for training and evaluating a Prototypical Network model on the FungiTastic dataset. 
+It includes functions for computing class prototypes, training and evaluating the model, and saving predictions. 
+The script uses PyTorch and OpenCLIP for model creation and image preprocessing.
+'''
 import os
 import torch
 import torch.nn as nn
@@ -30,6 +34,13 @@ def compute_prototypes(model, dataloader, device, num_classes):
     """
     Compute class prototypes by averaging embeddings from support samples
     for each class in the dataset.
+    Args:
+        model: FungiEmbedder
+        dataloader: training dataloader
+        device: cuda/cpu
+        num_classes: number of classes in the dataset
+    Returns:
+        prototypes: tensor [num_classes, embedding_dim]
     """
     model.eval()
     all_embeddings = [[] for _ in range(num_classes)]
@@ -59,6 +70,17 @@ def compute_prototypes(model, dataloader, device, num_classes):
 def train_epoch_protonet(model, dataloader, criterion, optimizer, device, prototypes):
     """
     Train one epoch using Prototypical Network logic.
+    Args:
+        model: FungiEmbedder
+        dataloader: training dataloader
+        criterion: PrototypicalLoss
+        optimizer: optimizer
+        device: cuda/cpu
+        prototypes: tensor [num_classes, embedding_dim]
+    Returns:
+        epoch_loss: average loss over the epoch
+        accuracy: accuracy score
+        f1: F1 score
     """
     model.train()
     epoch_loss = 0
@@ -90,6 +112,19 @@ def train_epoch_protonet(model, dataloader, criterion, optimizer, device, protot
 
 
 def evaluate_epoch_protonet(model, dataloader, criterion, device, prototypes):
+    '''
+    Evaluate one epoch using Prototypical Network logic.
+    Args:
+        model: FungiEmbedder
+        dataloader: validation dataloader
+        criterion: PrototypicalLoss
+        device: cuda/cpu
+        prototypes: tensor [num_classes, embedding_dim]
+    Returns:
+        epoch_loss: average loss over the epoch
+        accuracy: accuracy score
+        f1: F1 score
+    '''
     model.eval()
     epoch_loss = 0
     all_preds = []
@@ -117,6 +152,13 @@ def test_collate_fn(batch):
     """
     Custom collate function for test dataloader,
     allows category_id to be None.
+    Args:
+        batch: list of tuples (image, label, file_path, observation_id)
+    Returns:
+        images: tensor [B, C, H, W]
+        labels: list of None
+        file_paths: list of file paths
+        observation_ids: list of observation IDs
     """
     images = torch.stack([item[0] for item in batch])
     labels = [item[1] for item in batch]  # will be all None
@@ -130,8 +172,6 @@ def evaluate_protonet_grouped(model, dataloader, prototypes, device, dataset, k=
     """
     Evaluate using prototype similarity and group predictions by observation ID.
     Aggregates predictions per observation using mean pooling.
-
-
     Args:
         model: FungiEmbedder
         dataloader: test dataloader
@@ -140,6 +180,8 @@ def evaluate_protonet_grouped(model, dataloader, prototypes, device, dataset, k=
         dataset: FungiTastic (for ID mapping)
         k: number of top predictions
         save_path: CSV save path
+    Returns:
+        df: DataFrame with predictions
     """
     model.eval()
     observation_logits = {}
@@ -173,6 +215,11 @@ def evaluate_protonet_grouped(model, dataloader, prototypes, device, dataset, k=
 
 
 if __name__ == "__main__":
+    '''
+    Main function to train and evaluate the Prototypical Network model.
+    It loads the FungiTastic dataset, initializes the model, and trains it.
+    After training, it evaluates the model on the test set and saves predictions.
+    '''
     data_root = "data/fungi-clef-2025"
 
     # Load BioCLIP model and preprocessing function

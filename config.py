@@ -1,3 +1,11 @@
+# config.py
+'''
+This module contains the configuration settings for the model training and evaluation.
+It includes parameters such as batch size, learning rate, number of epochs,
+device settings, model name, number of classes, image size, and top K predictions.
+The settings are encapsulated in a Config class, which can be easily modified
+for different training runs.
+'''
 import torch
 from typing import List
 # Configuration class

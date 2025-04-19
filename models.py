@@ -1,3 +1,11 @@
+# model.py
+# -*- coding: utf-8 -*-
+'''
+This module contains the FungiTastic dataset class and a wrapper for a pre-trained visual model.
+The FungiTastic class is designed to load and preprocess images from the Danish Fungi dataset,
+supporting training, validation, and testing splits. It also includes methods for handling
+embeddings and displaying sample images.
+'''
 import os
 import pandas as pd
 import torch
